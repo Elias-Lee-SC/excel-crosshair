@@ -1,4 +1,4 @@
-# 十字光標 Excel 增益集 (Excel Crosshair)
+# 十字光標 Excel 增益集 CF 版
 
 
 
