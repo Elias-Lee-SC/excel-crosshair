@@ -8,12 +8,26 @@ Private Const SETTINGS_SECTION As String = "Settings"
 Private Const MENU_TAG As String = "CrosshairAddinMenu"
 Private Const DEFAULT_BASE_COLOR As Long = 10872468
 Private Const DEFAULT_PATTERN_COLOR As Long = 10872468
+Private Const VISIBLE_RANGE_BUFFER_SCREENS As Long = 20
+Private Const VISIBLE_RANGE_REFRESH_MARGIN_SCREENS As Long = 1
+Private Const MIN_BUFFER_ROWS As Long = 480
+Private Const MIN_BUFFER_COLUMNS As Long = 160
+Private Const MIN_REFRESH_MARGIN_ROWS As Long = 20
+Private Const MIN_REFRESH_MARGIN_COLUMNS As Long = 8
+Private Const WATCH_INTERVAL_SECONDS As Long = 1
 
 Private gEnabled As Boolean
 Private gInitialized As Boolean
 Private gUpdating As Boolean
 Private gOwnsStatusBar As Boolean
+Private gWatchScheduled As Boolean
+Private gNextWatchTime As Date
 Private gLastHighlightRange As Range
+Private gLastHighlightTopRow As Long
+Private gLastHighlightBottomRow As Long
+Private gLastHighlightLeftCol As Long
+Private gLastHighlightRightCol As Long
+Private gLastSelectionKey As String
 Private gBaseColor As Long
 Private gPatternColor As Long
 
@@ -30,6 +44,7 @@ Public Sub InitializeCrosshair()
     BuildCrosshairMenu
 
     ApplyToCurrentSelection
+    ScheduleCrosshairWatcher
     Exit Sub
 
 Fail:
@@ -52,17 +67,20 @@ Public Sub EnableCrosshair()
     gEnabled = True
     ClearStatus
     ApplyToCurrentSelection
+    ScheduleCrosshairWatcher
 End Sub
 
 Public Sub DisableCrosshair()
     EnsureInitialized
 
     gEnabled = False
+    CancelCrosshairWatcher
     CleanupAllOpenWorkbooks
     ShowStatus "Disabled"
 End Sub
 
 Public Sub CleanupCrosshair()
+    CancelCrosshairWatcher
     CleanupAllOpenWorkbooks
     ClearStatus
 End Sub
@@ -85,7 +103,9 @@ Public Sub ChooseCrosshairColor()
              "7  Red" & vbCrLf & _
              "8  Gray" & vbCrLf & _
              vbCrLf & _
-             "Or enter a custom hex color."
+             "Or enter a custom hex color." & vbCrLf & _
+             vbCrLf & _
+             "Current color: " & CurrentCrosshairColorText()
 
     choice = Application.InputBox(prompt, "Crosshair Color", "1", Type:=2)
     If choice = False Then Exit Sub
@@ -119,6 +139,7 @@ Public Sub ChooseCrosshairColor()
 
     SaveColorSettings
     ApplyToCurrentSelection
+    ScheduleCrosshairWatcher
 End Sub
 
 Public Sub ShowCrosshairColorPicker()
@@ -184,6 +205,7 @@ End Sub
 Public Sub TerminateCrosshair()
     On Error Resume Next
 
+    CancelCrosshairWatcher
     CleanupLastHighlight
     DeleteCrosshairMenu
     gInitialized = False
@@ -202,6 +224,17 @@ End Sub
 Public Function CrosshairIsEnabled() As Boolean
     CrosshairIsEnabled = gEnabled
 End Function
+
+Public Sub Crosshair_WatchVisibleRange()
+    gWatchScheduled = False
+
+    On Error GoTo SafeExit
+    If Not gEnabled Then Exit Sub
+    If Not gUpdating Then RefreshCrosshairForVisibleRange
+
+SafeExit:
+    If gEnabled Then ScheduleCrosshairWatcher
+End Sub
 
 Public Sub Crosshair_HandleSelectionChange(ByVal Sh As Object, ByVal Target As Range)
     If gUpdating Then Exit Sub
@@ -241,6 +274,124 @@ Private Sub EnsureInitialized()
     End If
 End Sub
 
+Private Sub ScheduleCrosshairWatcher()
+    On Error Resume Next
+    If Not gEnabled Then Exit Sub
+    If gWatchScheduled Then Exit Sub
+
+    Err.Clear
+    gNextWatchTime = DateAdd("s", WATCH_INTERVAL_SECONDS, Now)
+    Application.OnTime EarliestTime:=gNextWatchTime, _
+                       Procedure:=CrosshairWatcherProcedureName(), _
+                       Schedule:=True
+    gWatchScheduled = (Err.Number = 0)
+    Err.Clear
+End Sub
+
+Private Sub CancelCrosshairWatcher()
+    On Error Resume Next
+    If gWatchScheduled Then
+        Application.OnTime EarliestTime:=gNextWatchTime, _
+                           Procedure:=CrosshairWatcherProcedureName(), _
+                           Schedule:=False
+    End If
+
+    gWatchScheduled = False
+    Err.Clear
+End Sub
+
+Private Function CrosshairWatcherProcedureName() As String
+    CrosshairWatcherProcedureName = "'" & ThisWorkbook.Name & "'!Crosshair_WatchVisibleRange"
+End Function
+
+Private Function CrosshairSelectionKey(ByVal target As Range) As String
+    On Error GoTo Fail
+    CrosshairSelectionKey = target.Address(RowAbsolute:=True, _
+                                           ColumnAbsolute:=True, _
+                                           ReferenceStyle:=xlA1, _
+                                           External:=True)
+    Exit Function
+
+Fail:
+    CrosshairSelectionKey = vbNullString
+End Function
+
+Private Function CanPreserveHighlight(ByVal ws As Worksheet, ByVal selectionKey As String) As Boolean
+    On Error GoTo SafeExit
+    If Len(selectionKey) = 0 Then Exit Function
+    If selectionKey <> gLastSelectionKey Then Exit Function
+    If gLastHighlightRange Is Nothing Then Exit Function
+    If gLastHighlightTopRow = 0 Then Exit Function
+    If Not (gLastHighlightRange.Worksheet Is ws) Then Exit Function
+
+    CanPreserveHighlight = True
+
+SafeExit:
+End Function
+
+Private Sub RefreshCrosshairForVisibleRange()
+    Dim ws As Worksheet
+    Dim target As Range
+
+    On Error GoTo SafeExit
+    If Not (TypeOf ActiveSheet Is Worksheet) Then Exit Sub
+    If TypeName(Selection) <> "Range" Then Exit Sub
+
+    Set ws = ActiveSheet
+    If ws.ProtectContents Then Exit Sub
+
+    Set target = Selection
+    If target Is Nothing Then Exit Sub
+    If Not (target.Worksheet Is ws) Then Exit Sub
+
+    If gLastHighlightRange Is Nothing Then
+        ApplyCrosshairToSelection ws, target
+    ElseIf Not (gLastHighlightRange.Worksheet Is ws) Then
+        ApplyCrosshairToSelection ws, target
+    ElseIf VisibleRangeNeedsRefresh(ws) Then
+        ApplyCrosshairToSelection ws, target, True
+    End If
+
+SafeExit:
+End Sub
+
+Private Function VisibleRangeNeedsRefresh(ByVal ws As Worksheet) As Boolean
+    Dim topRow As Long
+    Dim bottomRow As Long
+    Dim leftCol As Long
+    Dim rightCol As Long
+    Dim visibleRows As Long
+    Dim visibleColumns As Long
+    Dim rowMargin As Long
+    Dim columnMargin As Long
+
+    If gLastHighlightTopRow = 0 Then
+        VisibleRangeNeedsRefresh = True
+        Exit Function
+    End If
+
+    If Not GetVisibleBounds(ws, topRow, bottomRow, leftCol, rightCol) Then Exit Function
+
+    visibleRows = bottomRow - topRow + 1
+    visibleColumns = rightCol - leftCol + 1
+    rowMargin = MaxLong(MIN_REFRESH_MARGIN_ROWS, visibleRows * VISIBLE_RANGE_REFRESH_MARGIN_SCREENS)
+    columnMargin = MaxLong(MIN_REFRESH_MARGIN_COLUMNS, visibleColumns * VISIBLE_RANGE_REFRESH_MARGIN_SCREENS)
+
+    If topRow < gLastHighlightTopRow Or bottomRow > gLastHighlightBottomRow Then
+        VisibleRangeNeedsRefresh = True
+    ElseIf leftCol < gLastHighlightLeftCol Or rightCol > gLastHighlightRightCol Then
+        VisibleRangeNeedsRefresh = True
+    ElseIf gLastHighlightTopRow > 1 And topRow <= gLastHighlightTopRow + rowMargin Then
+        VisibleRangeNeedsRefresh = True
+    ElseIf gLastHighlightBottomRow < ws.Rows.Count And bottomRow >= gLastHighlightBottomRow - rowMargin Then
+        VisibleRangeNeedsRefresh = True
+    ElseIf gLastHighlightLeftCol > 1 And leftCol <= gLastHighlightLeftCol + columnMargin Then
+        VisibleRangeNeedsRefresh = True
+    ElseIf gLastHighlightRightCol < ws.Columns.Count And rightCol >= gLastHighlightRightCol - columnMargin Then
+        VisibleRangeNeedsRefresh = True
+    End If
+End Function
+
 Private Sub ApplyToCurrentSelection()
     On Error GoTo SafeExit
 
@@ -252,11 +403,18 @@ Private Sub ApplyToCurrentSelection()
 SafeExit:
 End Sub
 
-Private Sub ApplyCrosshairToSelection(ByVal ws As Worksheet, ByVal target As Range)
+Private Sub ApplyCrosshairToSelection(ByVal ws As Worksheet, ByVal target As Range, _
+                                      Optional ByVal preserveExisting As Boolean = False)
     Dim wasSaved As Boolean
     Dim highlightRange As Range
     Dim formulaText As String
     Dim fc As FormatCondition
+    Dim topRow As Long
+    Dim bottomRow As Long
+    Dim leftCol As Long
+    Dim rightCol As Long
+    Dim selectionKey As String
+    Dim canPreserve As Boolean
 
     On Error GoTo Fail
     If ws Is Nothing Then Exit Sub
@@ -270,9 +428,15 @@ Private Sub ApplyCrosshairToSelection(ByVal ws As Worksheet, ByVal target As Ran
 
     wasSaved = WorkbookWasSaved(ws.Parent)
     gUpdating = True
+    selectionKey = CrosshairSelectionKey(target)
+    canPreserve = preserveExisting And CanPreserveHighlight(ws, selectionKey)
 
-    CleanupLastHighlight
-    Set highlightRange = BuildCrosshairRange(ws, target)
+    If canPreserve Then
+        Set highlightRange = BuildCrosshairExpansionRange(ws, target, topRow, bottomRow, leftCol, rightCol)
+    Else
+        CleanupLastHighlight
+        Set highlightRange = BuildCrosshairRange(ws, target, topRow, bottomRow, leftCol, rightCol)
+    End If
 
     If Not (highlightRange Is Nothing) Then
         formulaText = CrosshairFormula(target)
@@ -280,14 +444,22 @@ Private Sub ApplyCrosshairToSelection(ByVal ws As Worksheet, ByVal target As Ran
 
         ApplyCrosshairStyle fc
 
-        Set gLastHighlightRange = highlightRange
+        If canPreserve Then
+            AddToRange gLastHighlightRange, highlightRange
+            MergeHighlightBounds topRow, bottomRow, leftCol, rightCol
+        Else
+            Set gLastHighlightRange = highlightRange
+            RememberHighlightBounds topRow, bottomRow, leftCol, rightCol
+        End If
     End If
+    gLastSelectionKey = selectionKey
 
     RestoreWorkbookSavedState ws.Parent, wasSaved
     ClearStatus
 
 SafeExit:
     gUpdating = False
+    If gEnabled Then ScheduleCrosshairWatcher
     Exit Sub
 
 Fail:
@@ -316,6 +488,43 @@ Private Sub SetDefaultCrosshairGreen()
     gBaseColor = DEFAULT_BASE_COLOR
     gPatternColor = DEFAULT_PATTERN_COLOR
 End Sub
+
+Private Function CurrentCrosshairColorText() As String
+    Select Case gBaseColor
+        Case DEFAULT_BASE_COLOR
+            CurrentCrosshairColorText = "1 Green"
+        Case RGB(198, 237, 252)
+            CurrentCrosshairColorText = "2 Blue"
+        Case RGB(235, 208, 231)
+            CurrentCrosshairColorText = "3 Purple"
+        Case RGB(246, 233, 216)
+            CurrentCrosshairColorText = "4 Pink"
+        Case RGB(255, 228, 144)
+            CurrentCrosshairColorText = "5 Orange"
+        Case RGB(255, 254, 199)
+            CurrentCrosshairColorText = "6 Yellow"
+        Case RGB(255, 199, 206)
+            CurrentCrosshairColorText = "7 Red"
+        Case RGB(215, 216, 218)
+            CurrentCrosshairColorText = "8 Gray"
+        Case Else
+            CurrentCrosshairColorText = ColorToHexText(gBaseColor)
+    End Select
+End Function
+
+Private Function ColorToHexText(ByVal colorValue As Long) As String
+    Dim redPart As Long
+    Dim greenPart As Long
+    Dim bluePart As Long
+
+    redPart = colorValue Mod 256
+    greenPart = (colorValue \ 256) Mod 256
+    bluePart = (colorValue \ 65536) Mod 256
+
+    ColorToHexText = "#" & Right$("0" & Hex$(redPart), 2) & _
+                     Right$("0" & Hex$(greenPart), 2) & _
+                     Right$("0" & Hex$(bluePart), 2)
+End Function
 
 Private Function SetCrosshairColorFromHex(ByVal hexText As String) As Boolean
     Dim cleanHex As String
@@ -472,11 +681,56 @@ Private Function MenuTextRebuildMenu() As String
     MenuTextRebuildMenu = CrosshairCaption() & " " & ChrW(&H91CD) & ChrW(&H5EFA) & ChrW(&H6309) & ChrW(&H9215)
 End Function
 
-Private Function BuildCrosshairRange(ByVal ws As Worksheet, ByVal target As Range) As Range
-    Dim topRow As Long
-    Dim bottomRow As Long
-    Dim leftCol As Long
-    Dim rightCol As Long
+Private Function BuildCrosshairRange(ByVal ws As Worksheet, ByVal target As Range, _
+                                     ByRef topRow As Long, ByRef bottomRow As Long, _
+                                     ByRef leftCol As Long, ByRef rightCol As Long) As Range
+    If Not GetVisibleBounds(ws, topRow, bottomRow, leftCol, rightCol) Then
+        Exit Function
+    End If
+    ExpandVisibleBounds ws, topRow, bottomRow, leftCol, rightCol
+
+    Set BuildCrosshairRange = BuildCrosshairRangeWithinBounds(ws, target, topRow, bottomRow, leftCol, rightCol)
+End Function
+
+Private Function BuildCrosshairExpansionRange(ByVal ws As Worksheet, ByVal target As Range, _
+                                              ByRef topRow As Long, ByRef bottomRow As Long, _
+                                              ByRef leftCol As Long, ByRef rightCol As Long) As Range
+    Dim overlapTop As Long
+    Dim overlapBottom As Long
+    Dim result As Range
+
+    If Not GetVisibleBounds(ws, topRow, bottomRow, leftCol, rightCol) Then
+        Exit Function
+    End If
+    ExpandVisibleBounds ws, topRow, bottomRow, leftCol, rightCol
+
+    If topRow < gLastHighlightTopRow Then
+        AddToRange result, BuildCrosshairRangeWithinBounds(ws, target, topRow, gLastHighlightTopRow - 1, leftCol, rightCol)
+    End If
+
+    If bottomRow > gLastHighlightBottomRow Then
+        AddToRange result, BuildCrosshairRangeWithinBounds(ws, target, gLastHighlightBottomRow + 1, bottomRow, leftCol, rightCol)
+    End If
+
+    overlapTop = MaxLong(topRow, gLastHighlightTopRow)
+    overlapBottom = MinLong(bottomRow, gLastHighlightBottomRow)
+
+    If overlapTop <= overlapBottom Then
+        If leftCol < gLastHighlightLeftCol Then
+            AddToRange result, BuildCrosshairRangeWithinBounds(ws, target, overlapTop, overlapBottom, leftCol, gLastHighlightLeftCol - 1)
+        End If
+
+        If rightCol > gLastHighlightRightCol Then
+            AddToRange result, BuildCrosshairRangeWithinBounds(ws, target, overlapTop, overlapBottom, gLastHighlightRightCol + 1, rightCol)
+        End If
+    End If
+
+    Set BuildCrosshairExpansionRange = result
+End Function
+
+Private Function BuildCrosshairRangeWithinBounds(ByVal ws As Worksheet, ByVal target As Range, _
+                                                 ByVal topRow As Long, ByVal bottomRow As Long, _
+                                                 ByVal leftCol As Long, ByVal rightCol As Long) As Range
     Dim area As Range
     Dim rowStart As Long
     Dim rowEnd As Long
@@ -484,9 +738,8 @@ Private Function BuildCrosshairRange(ByVal ws As Worksheet, ByVal target As Rang
     Dim colEnd As Long
     Dim result As Range
 
-    If Not GetVisibleBounds(ws, topRow, bottomRow, leftCol, rightCol) Then
-        Exit Function
-    End If
+    If topRow > bottomRow Then Exit Function
+    If leftCol > rightCol Then Exit Function
 
     For Each area In target.Areas
         rowStart = MaxLong(area.Row, topRow)
@@ -503,7 +756,7 @@ Private Function BuildCrosshairRange(ByVal ws As Worksheet, ByVal target As Rang
         End If
     Next area
 
-    Set BuildCrosshairRange = result
+    Set BuildCrosshairRangeWithinBounds = result
 End Function
 
 Private Function GetVisibleBounds(ByVal ws As Worksheet, _
@@ -536,16 +789,122 @@ Fail:
     GetVisibleBounds = False
 End Function
 
+Private Sub ExpandVisibleBounds(ByVal ws As Worksheet, _
+                                ByRef topRow As Long, ByRef bottomRow As Long, _
+                                ByRef leftCol As Long, ByRef rightCol As Long)
+    Dim visibleRows As Long
+    Dim visibleColumns As Long
+    Dim rowPadding As Long
+    Dim columnPadding As Long
+
+    visibleRows = bottomRow - topRow + 1
+    visibleColumns = rightCol - leftCol + 1
+    rowPadding = MaxLong(MIN_BUFFER_ROWS, visibleRows * VISIBLE_RANGE_BUFFER_SCREENS)
+    columnPadding = MaxLong(MIN_BUFFER_COLUMNS, visibleColumns * VISIBLE_RANGE_BUFFER_SCREENS)
+
+    topRow = MaxLong(1, topRow - rowPadding)
+    bottomRow = MinLong(ws.Rows.Count, bottomRow + rowPadding)
+    leftCol = MaxLong(1, leftCol - columnPadding)
+    rightCol = MinLong(ws.Columns.Count, rightCol + columnPadding)
+End Sub
+
+Private Sub RememberHighlightBounds(ByVal topRow As Long, ByVal bottomRow As Long, _
+                                    ByVal leftCol As Long, ByVal rightCol As Long)
+    gLastHighlightTopRow = topRow
+    gLastHighlightBottomRow = bottomRow
+    gLastHighlightLeftCol = leftCol
+    gLastHighlightRightCol = rightCol
+End Sub
+
+Private Sub MergeHighlightBounds(ByVal topRow As Long, ByVal bottomRow As Long, _
+                                 ByVal leftCol As Long, ByVal rightCol As Long)
+    If gLastHighlightTopRow = 0 Then
+        RememberHighlightBounds topRow, bottomRow, leftCol, rightCol
+    Else
+        gLastHighlightTopRow = MinLong(gLastHighlightTopRow, topRow)
+        gLastHighlightBottomRow = MaxLong(gLastHighlightBottomRow, bottomRow)
+        gLastHighlightLeftCol = MinLong(gLastHighlightLeftCol, leftCol)
+        gLastHighlightRightCol = MaxLong(gLastHighlightRightCol, rightCol)
+    End If
+End Sub
+
+Private Sub ResetHighlightBounds()
+    gLastHighlightTopRow = 0
+    gLastHighlightBottomRow = 0
+    gLastHighlightLeftCol = 0
+    gLastHighlightRightCol = 0
+    gLastSelectionKey = vbNullString
+End Sub
+
 Private Function CrosshairFormula(ByVal target As Range) As String
-    Dim activeRow As Long
-    Dim activeCol As Long
+    Dim exclusionFormula As String
 
-    activeRow = ActiveCell.Row
-    activeCol = ActiveCell.Column
-
+    exclusionFormula = SelectionExclusionFormula(target)
     CrosshairFormula = "=AND(LEN(""" & CROSSHAIR_MARKER & """)>0," & _
-                       "NOT(AND(ROW()=" & CStr(activeRow) & _
-                       ",COLUMN()=" & CStr(activeCol) & ")))"
+                       "NOT(" & exclusionFormula & "))"
+End Function
+
+Private Function SelectionExclusionFormula(ByVal target As Range) As String
+    Dim area As Range
+    Dim expressionList As String
+    Dim expressionPart As String
+    Dim areaCount As Long
+
+    On Error GoTo Fallback
+
+    For Each area In target.Areas
+        expressionPart = RangeExclusionFormula(area)
+        If Len(expressionPart) > 0 Then
+            If Len(expressionList) > 0 Then expressionList = expressionList & ","
+            expressionList = expressionList & expressionPart
+            areaCount = areaCount + 1
+        End If
+    Next area
+
+    If Len(expressionList) = 0 Then GoTo Fallback
+
+    If areaCount = 1 Then
+        SelectionExclusionFormula = expressionList
+    Else
+        SelectionExclusionFormula = "OR(" & expressionList & ")"
+    End If
+    Exit Function
+
+Fallback:
+    SelectionExclusionFormula = ActiveCellExclusionFormula()
+End Function
+
+Private Function RangeExclusionFormula(ByVal selectedArea As Range) As String
+    Dim firstRow As Long
+    Dim lastRow As Long
+    Dim firstCol As Long
+    Dim lastCol As Long
+    Dim rowTest As String
+    Dim columnTest As String
+
+    firstRow = selectedArea.Row
+    lastRow = selectedArea.Row + selectedArea.Rows.Count - 1
+    firstCol = selectedArea.Column
+    lastCol = selectedArea.Column + selectedArea.Columns.Count - 1
+
+    If firstRow = lastRow Then
+        rowTest = "ROW()=" & CStr(firstRow)
+    Else
+        rowTest = "ROW()>=" & CStr(firstRow) & ",ROW()<=" & CStr(lastRow)
+    End If
+
+    If firstCol = lastCol Then
+        columnTest = "COLUMN()=" & CStr(firstCol)
+    Else
+        columnTest = "COLUMN()>=" & CStr(firstCol) & ",COLUMN()<=" & CStr(lastCol)
+    End If
+
+    RangeExclusionFormula = "AND(" & rowTest & "," & columnTest & ")"
+End Function
+
+Private Function ActiveCellExclusionFormula() As String
+    ActiveCellExclusionFormula = "AND(ROW()=" & CStr(ActiveCell.Row) & _
+                                 ",COLUMN()=" & CStr(ActiveCell.Column) & ")"
 End Function
 
 Private Sub AddToRange(ByRef baseRange As Range, ByVal rangeToAdd As Range)
@@ -654,6 +1013,7 @@ Private Sub CleanupLastHighlight()
         DeleteCrosshairRulesInRange gLastHighlightRange
         Set gLastHighlightRange = Nothing
     End If
+    ResetHighlightBounds
 End Sub
 
 Private Sub CleanupLastHighlightForWorkbook(ByVal wb As Workbook)
